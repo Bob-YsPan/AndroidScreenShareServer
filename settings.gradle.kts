@@ -21,4 +21,4 @@ dependencyResolutionManagement {
 
 rootProject.name = "ScreenShareServer"
 include(":app")
- 
+include(":app_client")

@@ -4,19 +4,23 @@ plugins {
 }
 
 android {
-    namespace = "com.crest247.screenshareserver"
+    namespace = "com.crest247.screenshareclient"
     compileSdk {
         version = release(36)
     }
 
     defaultConfig {
-        applicationId = "com.crest247.screenshareserver"
-        minSdk = 29
+        applicationId = "com.crest247.screenshareclient"
+        minSdk = 24
         targetSdk = 36
         versionCode = 1
         versionName = "1.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
+
+        ndk {
+            abiFilters.add("armeabi-v7a")
+        }
     }
 
     buildTypes {
@@ -26,6 +30,7 @@ android {
                 getDefaultProguardFile("proguard-android-optimize.txt"),
                 "proguard-rules.pro"
             )
+            signingConfig = signingConfigs.getByName("debug")
         }
     }
     compileOptions {

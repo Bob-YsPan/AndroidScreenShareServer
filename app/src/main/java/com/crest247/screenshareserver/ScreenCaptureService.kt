@@ -7,6 +7,7 @@ import android.app.PendingIntent
 import android.app.Service
 import android.content.Intent
 import android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION
+import android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE
 import android.os.IBinder
 import androidx.core.app.NotificationCompat
 
@@ -82,14 +83,14 @@ class ScreenCaptureService : Service() {
 
         val notification: Notification = NotificationCompat.Builder(this, CHANNEL_ID)
             .setContentTitle("Screen Share Server")
-            .setContentText("Sharing screen...")
+            .setContentText("Sharing screen and audio...")
             .setSmallIcon(R.mipmap.ic_launcher)
             .setContentIntent(pendingIntent)
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
             .setOngoing(true)
             .build()
 
-        startForeground(1, notification, FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION)
+        startForeground(1, notification, FOREGROUND_SERVICE_TYPE_MEDIA_PROJECTION or FOREGROUND_SERVICE_TYPE_MICROPHONE)
     }
 
     private fun createNotificationChannel() {

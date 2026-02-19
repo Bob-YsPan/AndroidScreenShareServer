@@ -1,5 +1,8 @@
 package com.crest247.screenshareclient
 
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioTrack
 import android.media.MediaCodec
 import android.media.MediaFormat
 import android.util.Log
@@ -18,6 +21,9 @@ class ScreenReceiver(
 
     private var udpSocket: DatagramSocket? = null
     private var mediaCodec: MediaCodec? = null
+    private var audioCodec: MediaCodec? = null
+    private var audioTrack: AudioTrack? = null
+
     private val isRunning = AtomicBoolean(false)
     private val TAG = "ScreenReceiver"
     private var receiverThread: Thread? = null
@@ -30,6 +36,7 @@ class ScreenReceiver(
     // Decoder State
     private var currentWidth = -1
     private var currentHeight = -1
+    private var isAudioCodecConfigured = false
 
     fun start(surface: Surface, host: String, port: Int) {
         if (isRunning.getAndSet(true)) {
@@ -59,6 +66,7 @@ class ScreenReceiver(
                 }
                 heartbeatThread.start()
 
+                setupAudioDecoder()
                 receiveLoop(surface)
 
             } catch (e: Exception) {
@@ -104,10 +112,21 @@ class ScreenReceiver(
                         System.arraycopy(data, 1, config, 0, length - 1)
                         submitConfigToDecoder(config)
                     }
+                    3 -> { // Audio Data (AAC)
+                        if (isAudioCodecConfigured) {
+                            val audioData = ByteArray(length - 1)
+                            System.arraycopy(data, 1, audioData, 0, length - 1)
+                            decodeAudio(audioData)
+                        }
+                    }
+                    4 -> { // Audio Config Data (AAC CSD)
+                        val config = ByteArray(length - 1)
+                        System.arraycopy(data, 1, config, 0, length - 1)
+                        submitAudioConfigToDecoder(config)
+                    }
                 }
             } catch (e: java.net.SocketTimeoutException) {
                 // Heartbeat still active, just haven't received data
-                // Log.v(TAG, "Wait...")
             } catch (e: Exception) {
                 if (isRunning.get()) Log.w(TAG, "Receive loop: ${e.message}")
             }
@@ -193,6 +212,23 @@ class ScreenReceiver(
         }
     }
 
+    private fun submitAudioConfigToDecoder(config: ByteArray) {
+        try {
+            val codec = audioCodec ?: return
+            val inputBufferIndex = codec.dequeueInputBuffer(10000)
+            if (inputBufferIndex >= 0) {
+                val inputBuffer = codec.getInputBuffer(inputBufferIndex)
+                inputBuffer?.clear()
+                inputBuffer?.put(config)
+                codec.queueInputBuffer(inputBufferIndex, 0, config.size, 0, MediaCodec.BUFFER_FLAG_CODEC_CONFIG)
+                isAudioCodecConfigured = true
+                Log.d(TAG, "Audio Decoder Config submitted")
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Audio Config submit error: ${e.message}")
+        }
+    }
+
     private fun setupDecoder(surface: Surface, width: Int, height: Int) {
         try {
             mediaCodec?.stop()
@@ -211,17 +247,94 @@ class ScreenReceiver(
         }
     }
 
+    private fun setupAudioDecoder() {
+        try {
+            val sampleRate = 44100
+            val channelCount = 2
+            val format = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, sampleRate, channelCount)
+            
+            audioCodec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
+            audioCodec?.configure(format, null, null, 0)
+            audioCodec?.start()
+
+            val minBufferSize = AudioTrack.getMinBufferSize(
+                sampleRate,
+                AudioFormat.CHANNEL_OUT_STEREO,
+                AudioFormat.ENCODING_PCM_16BIT
+            )
+
+            audioTrack = AudioTrack.Builder()
+                .setAudioAttributes(
+                    AudioAttributes.Builder()
+                        .setUsage(AudioAttributes.USAGE_MEDIA)
+                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
+                        .build()
+                )
+                .setAudioFormat(
+                    AudioFormat.Builder()
+                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                        .setSampleRate(sampleRate)
+                        .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
+                        .build()
+                )
+                .setBufferSizeInBytes(minBufferSize)
+                .setTransferMode(AudioTrack.MODE_STREAM)
+                .build()
+            
+            audioTrack?.play()
+            isAudioCodecConfigured = false
+            Log.d(TAG, "Audio Decoder and Track started")
+        } catch (e: Exception) {
+            Log.e(TAG, "Audio Setup Failed", e)
+        }
+    }
+
+    private fun decodeAudio(data: ByteArray) {
+        try {
+            val codec = audioCodec ?: return
+            val inputIndex = codec.dequeueInputBuffer(10000)
+            if (inputIndex >= 0) {
+                val inputBuffer = codec.getInputBuffer(inputIndex)
+                inputBuffer?.clear()
+                inputBuffer?.put(data)
+                codec.queueInputBuffer(inputIndex, 0, data.size, 0, 0)
+            }
+
+            val bufferInfo = MediaCodec.BufferInfo()
+            var outputIndex = codec.dequeueOutputBuffer(bufferInfo, 0)
+            while (outputIndex >= 0) {
+                val outputBuffer = codec.getOutputBuffer(outputIndex)
+                if (outputBuffer != null) {
+                    val pcm = ByteArray(bufferInfo.size)
+                    outputBuffer.get(pcm)
+                    audioTrack?.write(pcm, 0, pcm.size)
+                }
+                codec.releaseOutputBuffer(outputIndex, false)
+                outputIndex = codec.dequeueOutputBuffer(bufferInfo, 0)
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Audio Decode Error: ${e.message}")
+        }
+    }
+
     private fun cleanup() {
         isRunning.set(false)
         try {
             udpSocket?.close()
             mediaCodec?.stop()
             mediaCodec?.release()
+            audioCodec?.stop()
+            audioCodec?.release()
+            audioTrack?.stop()
+            audioTrack?.release()
         } catch (e: Exception) {}
         udpSocket = null
         mediaCodec = null
+        audioCodec = null
+        audioTrack = null
         currentWidth = -1
         currentHeight = -1
+        isAudioCodecConfigured = false
         onConnectionStateChanged(false)
     }
 

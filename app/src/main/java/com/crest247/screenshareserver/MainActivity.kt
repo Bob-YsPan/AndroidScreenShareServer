@@ -2,6 +2,7 @@ package com.crest247.screenshareserver
 
 import android.Manifest
 import android.content.Intent
+import android.content.pm.PackageManager
 import android.media.projection.MediaProjectionManager
 import android.os.Bundle
 import android.widget.Toast
@@ -9,7 +10,6 @@ import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
@@ -24,17 +24,21 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.unit.dp
+import androidx.core.content.ContextCompat
 import com.crest247.screenshareserver.ui.theme.ScreenShareServerTheme
 
 class MainActivity : ComponentActivity() {
 
     private var isSharing by mutableStateOf(false)
 
-    private val notificationPermissionLauncher = registerForActivityResult(
-        ActivityResultContracts.RequestPermission()
-    ) { isGranted: Boolean ->
-        if (!isGranted) {
-            Toast.makeText(this, "Notification permission required", Toast.LENGTH_SHORT).show()
+    private val permissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        val recordAudioGranted = permissions[Manifest.permission.RECORD_AUDIO] ?: false
+        val notificationGranted = permissions[Manifest.permission.POST_NOTIFICATIONS] ?: true
+        
+        if (!recordAudioGranted) {
+            Toast.makeText(this, "Audio record permission required for system audio", Toast.LENGTH_SHORT).show()
         }
     }
 
@@ -54,7 +58,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         enableEdgeToEdge()
 
-        requestNotificationPermission()
+        requestPermissions()
 
         setContent {
             ScreenShareServerTheme {
@@ -71,11 +75,26 @@ class MainActivity : ComponentActivity() {
         }
     }
 
-    private fun requestNotificationPermission() {
-        notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+    private fun requestPermissions() {
+        val permissions = mutableListOf<String>()
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            permissions.add(Manifest.permission.RECORD_AUDIO)
+        }
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU) {
+            if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED) {
+                permissions.add(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
+        if (permissions.isNotEmpty()) {
+            permissionLauncher.launch(permissions.toTypedArray())
+        }
     }
 
     private fun startScreenSharing() {
+        if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED) {
+            requestPermissions()
+            return
+        }
         val mediaProjectionManager =
             getSystemService(MEDIA_PROJECTION_SERVICE) as MediaProjectionManager
         mediaProjectionLauncher.launch(mediaProjectionManager.createScreenCaptureIntent())
@@ -104,7 +123,7 @@ fun ScreenShareScreen(
     isSharing: Boolean,
     onStartClick: () -> Unit,
     onStopClick: () -> Unit,
-    onStopped: () -> Unit, // Callback for external stop events
+    onStopped: () -> Unit,
     modifier: Modifier = Modifier
 ) {
     val ipAddress = remember { getIpAddress() }
@@ -114,7 +133,7 @@ fun ScreenShareScreen(
         val receiver = object : android.content.BroadcastReceiver() {
             override fun onReceive(context: android.content.Context?, intent: Intent?) {
                 if (intent?.action == "com.crest247.screenshareserver.STOPPED") {
-                    onStopped() // Notify parent to update state
+                    onStopped()
                 }
             }
         }

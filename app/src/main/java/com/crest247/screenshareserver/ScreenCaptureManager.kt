@@ -4,6 +4,10 @@ import android.content.Context
 import android.content.Intent
 import android.hardware.display.DisplayManager
 import android.hardware.display.VirtualDisplay
+import android.media.AudioAttributes
+import android.media.AudioFormat
+import android.media.AudioPlaybackCaptureConfiguration
+import android.media.AudioRecord
 import android.media.MediaCodec
 import android.media.MediaCodecInfo
 import android.media.MediaFormat
@@ -31,6 +35,9 @@ class ScreenCaptureManager(
     private var mediaCodec: MediaCodec? = null
     private var inputSurface: Surface? = null
 
+    private var audioCodec: MediaCodec? = null
+    private var audioRecord: AudioRecord? = null
+
     private var udpSocket: DatagramSocket? = null
     private var clientAddress: InetAddress? = null
     private var clientPort: Int = -1
@@ -44,6 +51,7 @@ class ScreenCaptureManager(
     private var density = 0
     
     private var configData: ByteArray? = null
+    private var audioConfigData: ByteArray? = null
     private var frameIndex: Short = 0
     
     private val displayManager = context.getSystemService(Context.DISPLAY_SERVICE) as DisplayManager
@@ -88,7 +96,9 @@ class ScreenCaptureManager(
 
             startServer()
             startEncoder()
+            startAudioEncoder()
             startVirtualDisplay()
+            startAudioCapture()
             
         } catch (e: Exception) {
             log("Manager Start Error: ${e.message}")
@@ -161,6 +171,18 @@ class ScreenCaptureManager(
         configData = null
     }
 
+    private fun stopAudio() {
+        try {
+            audioRecord?.stop()
+            audioRecord?.release()
+            audioCodec?.stop()
+            audioCodec?.release()
+        } catch (e: Exception) {}
+        audioRecord = null
+        audioCodec = null
+        audioConfigData = null
+    }
+
     fun stop() {
         if (!isRunning.getAndSet(false)) return
         
@@ -169,6 +191,7 @@ class ScreenCaptureManager(
             displayManager.unregisterDisplayListener(displayListener)
             virtualDisplay?.release()
             stopEncoder()
+            stopAudio()
             mediaProjection?.stop()
             udpSocket?.close()
         } catch (e: Exception) {
@@ -220,6 +243,13 @@ class ScreenCaptureManager(
             System.arraycopy(it, 0, configPacket, 1, it.size)
             sendUdpData(configPacket)
         }
+
+        audioConfigData?.let {
+            val configPacket = ByteArray(it.size + 1)
+            configPacket[0] = 4.toByte() // Type 4 for Audio Config
+            System.arraycopy(it, 0, configPacket, 1, it.size)
+            sendUdpData(configPacket)
+        }
     }
 
     private fun startEncoder() {
@@ -241,6 +271,48 @@ class ScreenCaptureManager(
         }
     }
 
+    private fun startAudioEncoder() {
+        try {
+            val format = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, 44100, 2)
+            format.setInteger(MediaFormat.KEY_AAC_PROFILE, MediaCodecInfo.CodecProfileLevel.AACObjectLC)
+            format.setInteger(MediaFormat.KEY_BIT_RATE, 128000)
+            format.setInteger(MediaFormat.KEY_MAX_INPUT_SIZE, 16384)
+
+            audioCodec = MediaCodec.createEncoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
+            audioCodec?.configure(format, null, null, MediaCodec.CONFIGURE_FLAG_ENCODE)
+            audioCodec?.start()
+        } catch (e: Exception) {
+            log("Audio Encoder Error: ${e.message}")
+        }
+    }
+
+    private fun startAudioCapture() {
+        val mp = mediaProjection ?: return
+        if (android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.Q) {
+            val config = AudioPlaybackCaptureConfiguration.Builder(mp)
+                .addMatchingUsage(AudioAttributes.USAGE_MEDIA)
+                .addMatchingUsage(AudioAttributes.USAGE_GAME)
+                .addMatchingUsage(AudioAttributes.USAGE_UNKNOWN)
+                .build()
+
+            val audioFormat = AudioFormat.Builder()
+                .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
+                .setSampleRate(44100)
+                .setChannelMask(AudioFormat.CHANNEL_IN_STEREO)
+                .build()
+
+            val minBufferSize = AudioRecord.getMinBufferSize(44100, AudioFormat.CHANNEL_IN_STEREO, AudioFormat.ENCODING_PCM_16BIT)
+            audioRecord = AudioRecord.Builder()
+                .setAudioPlaybackCaptureConfig(config)
+                .setAudioFormat(audioFormat)
+                .setBufferSizeInBytes(minBufferSize * 2)
+                .build()
+
+            audioRecord?.startRecording()
+            Thread { recordAudio() }.start()
+        }
+    }
+
     private fun startVirtualDisplay() {
         if (mediaProjection != null && inputSurface != null) {
             virtualDisplay = mediaProjection!!.createVirtualDisplay(
@@ -251,28 +323,36 @@ class ScreenCaptureManager(
         }
     }
 
-    private val frameQueue = java.util.concurrent.ArrayBlockingQueue<ByteArray>(2)
+    private val dataQueue = java.util.concurrent.ArrayBlockingQueue<ByteArray>(20)
 
     private fun startNetworkSender() {
         Thread {
             val MTU = 1300
             while (isRunning.get()) {
                 try {
-                    val data = frameQueue.take()
-                    val totalParts = ((data.size + MTU - 1) / MTU)
-                    for (i in 0 until totalParts) {
-                        val offset = i * MTU
-                        val length = minOf(MTU, data.size - offset)
-                        val packetData = ByteArray(length + 5)
-                        val buffer = ByteBuffer.wrap(packetData)
-                        buffer.put(1.toByte())
-                        buffer.putShort(frameIndex)
-                        buffer.put(i.toByte())
-                        buffer.put(totalParts.toByte())
-                        System.arraycopy(data, offset, packetData, 5, length)
-                        sendUdpData(packetData)
+                    val packet = dataQueue.take()
+                    val type = packet[0]
+                    if (type == 1.toByte()) { // Video Frame
+                        val data = ByteArray(packet.size - 1)
+                        System.arraycopy(packet, 1, data, 0, data.size)
+                        
+                        val totalParts = ((data.size + MTU - 1) / MTU)
+                        for (i in 0 until totalParts) {
+                            val offset = i * MTU
+                            val length = minOf(MTU, data.size - offset)
+                            val packetData = ByteArray(length + 5)
+                            val buffer = ByteBuffer.wrap(packetData)
+                            buffer.put(1.toByte())
+                            buffer.putShort(frameIndex)
+                            buffer.put(i.toByte())
+                            buffer.put(totalParts.toByte())
+                            System.arraycopy(data, offset, packetData, 5, length)
+                            sendUdpData(packetData)
+                        }
+                        frameIndex++
+                    } else { // Audio Data (3) or Audio Config (4)
+                        sendUdpData(packet)
                     }
-                    frameIndex++
                 } catch (e: Exception) {
                     if (isRunning.get()) log("UDP Send Loop Error: ${e.message}")
                 }
@@ -300,19 +380,77 @@ class ScreenCaptureManager(
                 if (outputBufferIndex >= 0) {
                     val outputBuffer = currentCodec.getOutputBuffer(outputBufferIndex)
                     if (outputBuffer != null) {
+                        outputBuffer.position(bufferInfo.offset)
+                        outputBuffer.limit(bufferInfo.offset + bufferInfo.size)
+                        
                         val data = ByteArray(bufferInfo.size)
                         outputBuffer.get(data)
+                        
                         if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
                             configData = data
                         }
-                        if (!frameQueue.offer(data)) {
-                            frameQueue.poll()
-                            frameQueue.offer(data)
+                        
+                        val packet = ByteArray(data.size + 1)
+                        packet[0] = 1.toByte()
+                        System.arraycopy(data, 0, packet, 1, data.size)
+                        
+                        if (!dataQueue.offer(packet)) {
+                            dataQueue.poll()
+                            dataQueue.offer(packet)
                         }
                     }
                     currentCodec.releaseOutputBuffer(outputBufferIndex, false)
                 }
             } catch (e: Exception) { break }
+        }
+    }
+
+    private fun recordAudio() {
+        val bufferInfo = MediaCodec.BufferInfo()
+        val pcmBuffer = ByteArray(4096)
+        while (isRunning.get()) {
+            val read = audioRecord?.read(pcmBuffer, 0, pcmBuffer.size) ?: -1
+            if (read > 0) {
+                val inputIndex = audioCodec?.dequeueInputBuffer(10000) ?: -1
+                if (inputIndex >= 0) {
+                    val inputBuffer = audioCodec?.getInputBuffer(inputIndex)
+                    inputBuffer?.clear()
+                    inputBuffer?.put(pcmBuffer, 0, read)
+                    audioCodec?.queueInputBuffer(inputIndex, 0, read, System.nanoTime() / 1000, 0)
+                }
+            }
+
+            var outputIndex = audioCodec?.dequeueOutputBuffer(bufferInfo, 0) ?: -1
+            while (outputIndex >= 0) {
+                val outputBuffer = audioCodec?.getOutputBuffer(outputIndex)
+                if (outputBuffer != null) {
+                    outputBuffer.position(bufferInfo.offset)
+                    outputBuffer.limit(bufferInfo.offset + bufferInfo.size)
+
+                    val data = ByteArray(bufferInfo.size)
+                    outputBuffer.get(data)
+
+                    if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
+                        audioConfigData = data
+                        // Also send it immediately
+                        val configPacket = ByteArray(data.size + 1)
+                        configPacket[0] = 4.toByte()
+                        System.arraycopy(data, 0, configPacket, 1, data.size)
+                        dataQueue.offer(configPacket)
+                    } else {
+                        val packet = ByteArray(data.size + 1)
+                        packet[0] = 3.toByte() // Type 3 for Audio
+                        System.arraycopy(data, 0, packet, 1, data.size)
+                        
+                        if (!dataQueue.offer(packet)) {
+                            dataQueue.poll()
+                            dataQueue.offer(packet)
+                        }
+                    }
+                }
+                audioCodec?.releaseOutputBuffer(outputIndex, false)
+                outputIndex = audioCodec?.dequeueOutputBuffer(bufferInfo, 0) ?: -1
+            }
         }
     }
 }

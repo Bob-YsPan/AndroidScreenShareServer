@@ -4,13 +4,18 @@ import android.media.AudioAttributes
 import android.media.AudioFormat
 import android.media.AudioTrack
 import android.media.MediaCodec
+import android.media.MediaCodecList
 import android.media.MediaFormat
+import android.os.Build
 import android.util.Log
 import android.view.Surface
 import java.net.DatagramPacket
 import java.net.DatagramSocket
 import java.net.InetAddress
 import java.nio.ByteBuffer
+import java.util.concurrent.ArrayBlockingQueue
+import java.util.concurrent.BlockingQueue
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 class ScreenReceiver(
@@ -18,71 +23,72 @@ class ScreenReceiver(
     private val onConnectionStateChanged: (Boolean) -> Unit,
     private val onMessage: (String) -> Unit = {}
 ) {
+    private val TAG = "ScreenReceiver"
+    private val isRunning = AtomicBoolean(false)
 
     private var udpSocket: DatagramSocket? = null
-    private var mediaCodec: MediaCodec? = null
-    private var audioCodec: MediaCodec? = null
-    private var audioTrack: AudioTrack? = null
-
-    private val isRunning = AtomicBoolean(false)
-    private val TAG = "ScreenReceiver"
     private var receiverThread: Thread? = null
+    private var videoThread: Thread? = null
+    private var audioThread: Thread? = null
 
-    // Frame Reassembly
+    private val videoQueue: BlockingQueue<VideoTask> = ArrayBlockingQueue(2)
+    private val audioQueue: BlockingQueue<AudioTask> = ArrayBlockingQueue(10)
+
+    private sealed class VideoTask {
+        data class Setup(val surface: Surface, val width: Int, val height: Int) : VideoTask()
+        data class Config(val data: ByteArray) : VideoTask()
+        data class Frame(val data: ByteArray) : VideoTask()
+    }
+
+    private sealed class AudioTask {
+        data class Config(val data: ByteArray) : AudioTask()
+        data class Data(val data: ByteArray) : AudioTask()
+    }
+
+    // Reassembly state (only used in receiver thread)
     private var currentFrameIndex: Short = -1
     private var frameBuffer: Array<ByteArray?>? = null
     private var receivedPartsCount = 0
-    
-    // Decoder State
-    private var currentWidth = -1
-    private var currentHeight = -1
-    private var isAudioCodecConfigured = false
 
     fun start(surface: Surface, host: String, port: Int) {
-        if (isRunning.getAndSet(true)) {
-            Log.w(TAG, "ScreenReceiver already running")
-            return
-        }
+        if (isRunning.getAndSet(true)) return
+
+        startVideoThread()
+        startAudioThread()
 
         receiverThread = Thread {
-            Log.d(TAG, "Receiver Thread Started (UDP): $host:$port")
-            
             try {
                 udpSocket = DatagramSocket()
-                udpSocket?.soTimeout = 2000 // 2 seconds timeout
-                val serverAddr = InetAddress.getByName(host)
-
-                // Send Heartbeat to let server know our IP/Port
-                val heartbeat = ByteArray(1) { 0xFF.toByte() }
-                val heartbeatPacket = DatagramPacket(heartbeat, heartbeat.size, serverAddr, port)
+                udpSocket?.soTimeout = 2000
+                udpSocket?.receiveBufferSize = 1024 * 1024 // 1MB is usually enough and avoids excessive bufferbloat
                 
-                val heartbeatThread = Thread {
+                val serverAddr = InetAddress.getByName(host)
+                val heartbeatPacket = DatagramPacket(ByteArray(1) { 0xFF.toByte() }, 1, serverAddr, port)
+                
+                // Heartbeat thread
+                val hbThread = Thread {
                     while (isRunning.get()) {
                         try {
                             udpSocket?.send(heartbeatPacket)
-                            Thread.sleep(1000) // Heartbeat every 1s
+                            Thread.sleep(1000)
                         } catch (e: Exception) { break }
                     }
                 }
-                heartbeatThread.start()
+                hbThread.start()
 
-                setupAudioDecoder()
                 receiveLoop(surface)
-
             } catch (e: Exception) {
-                Log.e(TAG, "UDP Error: ${e.message}")
-                onMessage("Error: ${e.message}")
+                Log.e(TAG, "Receiver error: ${e.message}")
             } finally {
-                cleanup()
+                stop()
             }
         }
         receiverThread?.start()
     }
 
     private fun receiveLoop(surface: Surface) {
-        val buffer = ByteArray(2048)
+        val buffer = ByteArray(8192)
         val packet = DatagramPacket(buffer, buffer.size)
-        
         onConnectionStateChanged(true)
 
         while (isRunning.get()) {
@@ -92,43 +98,37 @@ class ScreenReceiver(
                 val length = packet.length
                 if (length < 1) continue
 
-                val type = data[0].toInt()
-                when (type) {
-                    0 -> { // Meta Data
+                when (data[0].toInt()) {
+                    0 -> { // Meta
                         val bb = ByteBuffer.wrap(data, 1, length - 1)
-                        val width = bb.getInt()
-                        val height = bb.getInt()
-                        if (width != currentWidth || height != currentHeight) {
-                            Log.d(TAG, "Metadata Change: ${width}x${height}")
-                            setupDecoder(surface, width, height)
-                            onAspectRatioChanged(width.toFloat() / height.toFloat())
-                        }
+                        val w = bb.getInt()
+                        val h = bb.getInt()
+                        videoQueue.offer(VideoTask.Setup(surface, w, h))
+                        onAspectRatioChanged(w.toFloat() / h.toFloat())
                     }
-                    1 -> { // Frame Data
-                        handleFramePart(data, length)
-                    }
-                    2 -> { // Config Data (SPS/PPS)
+                    1 -> handleFramePart(data, length)
+                    2 -> { // Video Config
                         val config = ByteArray(length - 1)
                         System.arraycopy(data, 1, config, 0, length - 1)
-                        submitConfigToDecoder(config)
+                        videoQueue.offer(VideoTask.Config(config))
                     }
-                    3 -> { // Audio Data (AAC)
-                        if (isAudioCodecConfigured) {
-                            val audioData = ByteArray(length - 1)
-                            System.arraycopy(data, 1, audioData, 0, length - 1)
-                            decodeAudio(audioData)
+                    3 -> { // Audio Data
+                        val audio = ByteArray(length - 1)
+                        System.arraycopy(data, 1, audio, 0, length - 1)
+                        if (!audioQueue.offer(AudioTask.Data(audio))) {
+                            audioQueue.poll() // Drop oldest if full to maintain low latency
+                            audioQueue.offer(AudioTask.Data(audio))
                         }
                     }
-                    4 -> { // Audio Config Data (AAC CSD)
+                    4 -> { // Audio Config
                         val config = ByteArray(length - 1)
                         System.arraycopy(data, 1, config, 0, length - 1)
-                        submitAudioConfigToDecoder(config)
+                        audioQueue.offer(AudioTask.Config(config))
                     }
                 }
-            } catch (e: java.net.SocketTimeoutException) {
-                // Heartbeat still active, just haven't received data
             } catch (e: Exception) {
-                if (isRunning.get()) Log.w(TAG, "Receive loop: ${e.message}")
+                if (e is java.net.SocketTimeoutException) continue
+                if (isRunning.get()) Log.w(TAG, "Receive error: ${e.message}")
             }
         }
     }
@@ -154,193 +154,225 @@ class ScreenReceiver(
             receivedPartsCount++
 
             if (receivedPartsCount == totalParts) {
-                assembleAndDecode()
+                assembleAndQueue()
             }
         }
     }
 
-    private fun assembleAndDecode() {
-        val buffer = frameBuffer ?: return
+    private fun assembleAndQueue() {
+        val parts = frameBuffer ?: return
         var totalSize = 0
-        for (part in buffer) {
-            totalSize += part?.size ?: 0
-        }
-
-        val fullFrame = ByteArray(totalSize)
+        for (p in parts) totalSize += p?.size ?: 0
+        
+        val assembled = ByteArray(totalSize)
         var offset = 0
-        for (part in buffer) {
-            if (part != null) {
-                System.arraycopy(part, 0, fullFrame, offset, part.size)
-                offset += part.size
+        for (p in parts) {
+            if (p != null) {
+                System.arraycopy(p, 0, assembled, offset, p.size)
+                offset += p.size
             }
         }
 
-        try {
-            val codec = mediaCodec ?: return
-            val inputBufferIndex = codec.dequeueInputBuffer(0)
-            if (inputBufferIndex >= 0) {
-                val inputBuffer = codec.getInputBuffer(inputBufferIndex)
-                inputBuffer?.clear()
-                inputBuffer?.put(fullFrame)
-                codec.queueInputBuffer(inputBufferIndex, 0, totalSize, 0, 0)
-            }
-
-            val bufferInfo = MediaCodec.BufferInfo()
-            var outputBufferIndex = codec.dequeueOutputBuffer(bufferInfo, 0)
-            while (outputBufferIndex >= 0) {
-                codec.releaseOutputBuffer(outputBufferIndex, true)
-                outputBufferIndex = codec.dequeueOutputBuffer(bufferInfo, 0)
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Decode error: ${e.message}")
+        if (!videoQueue.offer(VideoTask.Frame(assembled))) {
+            videoQueue.poll() // Drop oldest frame to catch up and reduce latency
+            videoQueue.offer(VideoTask.Frame(assembled))
         }
     }
 
-    private fun submitConfigToDecoder(config: ByteArray) {
-        try {
-            val codec = mediaCodec ?: return
-            val inputBufferIndex = codec.dequeueInputBuffer(10000)
-            if (inputBufferIndex >= 0) {
-                val inputBuffer = codec.getInputBuffer(inputBufferIndex)
-                inputBuffer?.clear()
-                inputBuffer?.put(config)
-                codec.queueInputBuffer(inputBufferIndex, 0, config.size, 0, MediaCodec.BUFFER_FLAG_CODEC_CONFIG)
-                Log.d(TAG, "Decoder Config submitted")
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Config submit error: ${e.message}")
-        }
-    }
+    private fun startVideoThread() {
+        videoThread = Thread {
+            var codec: MediaCodec? = null
+            var lastWidth = -1
+            var lastHeight = -1
 
-    private fun submitAudioConfigToDecoder(config: ByteArray) {
-        try {
-            val codec = audioCodec ?: return
-            val inputBufferIndex = codec.dequeueInputBuffer(10000)
-            if (inputBufferIndex >= 0) {
-                val inputBuffer = codec.getInputBuffer(inputBufferIndex)
-                inputBuffer?.clear()
-                inputBuffer?.put(config)
-                codec.queueInputBuffer(inputBufferIndex, 0, config.size, 0, MediaCodec.BUFFER_FLAG_CODEC_CONFIG)
-                isAudioCodecConfigured = true
-                Log.d(TAG, "Audio Decoder Config submitted")
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Audio Config submit error: ${e.message}")
-        }
-    }
-
-    private fun setupDecoder(surface: Surface, width: Int, height: Int) {
-        try {
-            mediaCodec?.stop()
-            mediaCodec?.release()
-            
-            currentWidth = width
-            currentHeight = height
-            
-            mediaCodec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_VIDEO_AVC)
-            val format = MediaFormat.createVideoFormat(MediaFormat.MIMETYPE_VIDEO_AVC, width, height)
-            mediaCodec?.configure(format, surface, null, 0)
-            mediaCodec?.start()
-            Log.d(TAG, "Decoder Started: ${width}x${height}")
-        } catch (e: Exception) {
-            Log.e(TAG, "Decoder Setup Failed", e)
-        }
-    }
-
-    private fun setupAudioDecoder() {
-        try {
-            val sampleRate = 44100
-            val channelCount = 2
-            val format = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, sampleRate, channelCount)
-            
-            audioCodec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
-            audioCodec?.configure(format, null, null, 0)
-            audioCodec?.start()
-
-            val minBufferSize = AudioTrack.getMinBufferSize(
-                sampleRate,
-                AudioFormat.CHANNEL_OUT_STEREO,
-                AudioFormat.ENCODING_PCM_16BIT
-            )
-
-            audioTrack = AudioTrack.Builder()
-                .setAudioAttributes(
-                    AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_MEDIA)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_MUSIC)
-                        .build()
-                )
-                .setAudioFormat(
-                    AudioFormat.Builder()
-                        .setEncoding(AudioFormat.ENCODING_PCM_16BIT)
-                        .setSampleRate(sampleRate)
-                        .setChannelMask(AudioFormat.CHANNEL_OUT_STEREO)
-                        .build()
-                )
-                .setBufferSizeInBytes(minBufferSize)
-                .setTransferMode(AudioTrack.MODE_STREAM)
-                .build()
-            
-            audioTrack?.play()
-            isAudioCodecConfigured = false
-            Log.d(TAG, "Audio Decoder and Track started")
-        } catch (e: Exception) {
-            Log.e(TAG, "Audio Setup Failed", e)
-        }
-    }
-
-    private fun decodeAudio(data: ByteArray) {
-        try {
-            val codec = audioCodec ?: return
-            val inputIndex = codec.dequeueInputBuffer(10000)
-            if (inputIndex >= 0) {
-                val inputBuffer = codec.getInputBuffer(inputIndex)
-                inputBuffer?.clear()
-                inputBuffer?.put(data)
-                codec.queueInputBuffer(inputIndex, 0, data.size, 0, 0)
-            }
-
-            val bufferInfo = MediaCodec.BufferInfo()
-            var outputIndex = codec.dequeueOutputBuffer(bufferInfo, 0)
-            while (outputIndex >= 0) {
-                val outputBuffer = codec.getOutputBuffer(outputIndex)
-                if (outputBuffer != null) {
-                    val pcm = ByteArray(bufferInfo.size)
-                    outputBuffer.get(pcm)
-                    audioTrack?.write(pcm, 0, pcm.size)
+            while (isRunning.get()) {
+                try {
+                    val task = videoQueue.poll(100, TimeUnit.MILLISECONDS) ?: continue
+                    when (task) {
+                        is VideoTask.Setup -> {
+                            if (task.width != lastWidth || task.height != lastHeight) {
+                                codec?.stop()
+                                codec?.release()
+                                codec = createVideoDecoder(task.surface, task.width, task.height)
+                                lastWidth = task.width
+                                lastHeight = task.height
+                            }
+                        }
+                        is VideoTask.Config -> {
+                            codec?.let { submitConfig(it, task.data) }
+                        }
+                        is VideoTask.Frame -> {
+                            codec?.let { decodeVideoFrame(it, task.data) }
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Video thread error: ${e.message}")
                 }
-                codec.releaseOutputBuffer(outputIndex, false)
-                outputIndex = codec.dequeueOutputBuffer(bufferInfo, 0)
             }
-        } catch (e: Exception) {
-            Log.e(TAG, "Audio Decode Error: ${e.message}")
+            codec?.stop()
+            codec?.release()
+        }
+        videoThread?.start()
+    }
+
+    private fun createVideoDecoder(surface: Surface, width: Int, height: Int): MediaCodec {
+        val mime = MediaFormat.MIMETYPE_VIDEO_AVC
+        val hardwareName = findHardwareDecoder(mime)
+        val codec = if (hardwareName != null) {
+            Log.d(TAG, "Using hardware decoder: $hardwareName")
+            MediaCodec.createByCodecName(hardwareName)
+        } else {
+            MediaCodec.createDecoderByType(mime)
+        }
+
+        val format = MediaFormat.createVideoFormat(mime, width, height)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
+        }
+        format.setInteger(MediaFormat.KEY_PRIORITY, 0)
+        format.setInteger(MediaFormat.KEY_OPERATING_RATE, 240)
+        
+        codec.configure(format, surface, null, 0)
+        codec.start()
+        return codec
+    }
+
+    private fun decodeVideoFrame(codec: MediaCodec, data: ByteArray) {
+        val inputIndex = codec.dequeueInputBuffer(0)
+        if (inputIndex >= 0) {
+            val inputBuffer = codec.getInputBuffer(inputIndex)
+            inputBuffer?.clear()
+            inputBuffer?.put(data)
+            codec.queueInputBuffer(inputIndex, 0, data.size, 0, 0)
+        }
+
+        val info = MediaCodec.BufferInfo()
+        var outputIndex = codec.dequeueOutputBuffer(info, 0)
+        while (outputIndex >= 0) {
+            codec.releaseOutputBuffer(outputIndex, true)
+            outputIndex = codec.dequeueOutputBuffer(info, 0)
         }
     }
 
-    private fun cleanup() {
-        isRunning.set(false)
-        try {
-            udpSocket?.close()
-            mediaCodec?.stop()
-            mediaCodec?.release()
-            audioCodec?.stop()
-            audioCodec?.release()
-            audioTrack?.stop()
-            audioTrack?.release()
-        } catch (e: Exception) {}
-        udpSocket = null
-        mediaCodec = null
-        audioCodec = null
-        audioTrack = null
-        currentWidth = -1
-        currentHeight = -1
-        isAudioCodecConfigured = false
-        onConnectionStateChanged(false)
+    private fun submitConfig(codec: MediaCodec, data: ByteArray) {
+        val inputIndex = codec.dequeueInputBuffer(10000)
+        if (inputIndex >= 0) {
+            val inputBuffer = codec.getInputBuffer(inputIndex)
+            inputBuffer?.clear()
+            inputBuffer?.put(data)
+            codec.queueInputBuffer(inputIndex, 0, data.size, 0, MediaCodec.BUFFER_FLAG_CODEC_CONFIG)
+        }
+    }
+
+    private fun startAudioThread() {
+        audioThread = Thread {
+            var codec: MediaCodec? = null
+            var track: AudioTrack? = null
+            var isConfigured = false
+
+            while (isRunning.get()) {
+                try {
+                    val task = audioQueue.poll(100, TimeUnit.MILLISECONDS) ?: continue
+                    if (codec == null) {
+                        val result = setupAudio()
+                        codec = result.first
+                        track = result.second
+                    }
+
+                    when (task) {
+                        is AudioTask.Config -> {
+                            codec?.let {
+                                submitConfig(it, task.data)
+                                isConfigured = true
+                            }
+                        }
+                        is AudioTask.Data -> {
+                            if (isConfigured) {
+                                codec?.let { c ->
+                                    track?.let { t -> decodeAudioFrame(c, t, task.data) }
+                                }
+                            }
+                        }
+                    }
+                } catch (e: Exception) {
+                    Log.e(TAG, "Audio thread error: ${e.message}")
+                }
+            }
+            codec?.stop()
+            codec?.release()
+            track?.stop()
+            track?.release()
+        }
+        audioThread?.start()
+    }
+
+    private fun setupAudio(): Pair<MediaCodec, AudioTrack> {
+        val sampleRate = 44100
+        val format = MediaFormat.createAudioFormat(MediaFormat.MIMETYPE_AUDIO_AAC, sampleRate, 2)
+        val codec = MediaCodec.createDecoderByType(MediaFormat.MIMETYPE_AUDIO_AAC)
+        codec.configure(format, null, null, 0)
+        codec.start()
+
+        val minBuf = AudioTrack.getMinBufferSize(sampleRate, AudioFormat.CHANNEL_OUT_STEREO, AudioFormat.ENCODING_PCM_16BIT)
+        val track = AudioTrack.Builder()
+            .setAudioAttributes(AudioAttributes.Builder().setUsage(AudioAttributes.USAGE_MEDIA).setContentType(AudioAttributes.CONTENT_TYPE_MUSIC).build())
+            .setAudioFormat(AudioFormat.Builder().setEncoding(AudioFormat.ENCODING_PCM_16BIT).setSampleRate(sampleRate).setChannelMask(AudioFormat.CHANNEL_OUT_STEREO).build())
+            .setBufferSizeInBytes(minBuf)
+            .setTransferMode(AudioTrack.MODE_STREAM)
+            .apply {
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    setPerformanceMode(AudioTrack.PERFORMANCE_MODE_LOW_LATENCY)
+                }
+            }
+            .build()
+        track.play()
+        return Pair(codec, track)
+    }
+
+    private fun decodeAudioFrame(codec: MediaCodec, track: AudioTrack, data: ByteArray) {
+        val inputIndex = codec.dequeueInputBuffer(0)
+        if (inputIndex >= 0) {
+            val inputBuffer = codec.getInputBuffer(inputIndex)
+            inputBuffer?.clear()
+            inputBuffer?.put(data)
+            codec.queueInputBuffer(inputIndex, 0, data.size, 0, 0)
+        }
+
+        val info = MediaCodec.BufferInfo()
+        var outputIndex = codec.dequeueOutputBuffer(info, 0)
+        while (outputIndex >= 0) {
+            val outBuf = codec.getOutputBuffer(outputIndex)
+            if (outBuf != null) {
+                val pcm = ByteArray(info.size)
+                outBuf.get(pcm)
+                track.write(pcm, 0, pcm.size)
+            }
+            codec.releaseOutputBuffer(outputIndex, false)
+            outputIndex = codec.dequeueOutputBuffer(info, 0)
+        }
+    }
+
+    private fun findHardwareDecoder(mime: String): String? {
+        val list = MediaCodecList(MediaCodecList.REGULAR_CODECS)
+        for (info in list.codecInfos) {
+            if (info.isEncoder) continue
+            for (type in info.supportedTypes) {
+                if (type.equals(mime, ignoreCase = true)) {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                        if (info.isHardwareAccelerated) return info.name
+                    } else {
+                        val name = info.name.lowercase()
+                        if (!name.startsWith("omx.google.") && !name.startsWith("c2.android.") && !name.contains("sw")) return info.name
+                    }
+                }
+            }
+        }
+        return null
     }
 
     fun stop() {
-        isRunning.set(false)
-        receiverThread?.interrupt()
-        cleanup()
+        if (!isRunning.getAndSet(false)) return
+        udpSocket?.close()
+        onConnectionStateChanged(false)
     }
 }

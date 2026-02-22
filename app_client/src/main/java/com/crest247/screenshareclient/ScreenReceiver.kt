@@ -31,22 +31,25 @@ class ScreenReceiver(
     private var videoThread: Thread? = null
     private var audioThread: Thread? = null
 
-    private val videoQueue: BlockingQueue<VideoTask> = ArrayBlockingQueue(2)
-    private val audioQueue: BlockingQueue<AudioTask> = ArrayBlockingQueue(10)
+    private val videoQueue: BlockingQueue<VideoTask> = ArrayBlockingQueue(5)
+    private val audioQueue: BlockingQueue<AudioTask> = ArrayBlockingQueue(15)
+
+    private var serverTimeOffset: Long = 0
 
     private sealed class VideoTask {
-        data class Setup(val surface: Surface, val width: Int, val height: Int) : VideoTask()
+        data class Setup(val surface: Surface, val width: Int, val height: Int, val serverTime: Long) : VideoTask()
         data class Config(val data: ByteArray) : VideoTask()
-        data class Frame(val data: ByteArray) : VideoTask()
+        data class Frame(val data: ByteArray, val timestamp: Long) : VideoTask()
     }
 
     private sealed class AudioTask {
         data class Config(val data: ByteArray) : AudioTask()
-        data class Data(val data: ByteArray) : AudioTask()
+        data class Data(val data: ByteArray, val timestamp: Long) : AudioTask()
     }
 
-    // Reassembly state (only used in receiver thread)
+    // Reassembly state
     private var currentFrameIndex: Short = -1
+    private var currentFrameTimestamp: Long = 0
     private var frameBuffer: Array<ByteArray?>? = null
     private var receivedPartsCount = 0
 
@@ -60,12 +63,11 @@ class ScreenReceiver(
             try {
                 udpSocket = DatagramSocket()
                 udpSocket?.soTimeout = 2000
-                udpSocket?.receiveBufferSize = 1024 * 1024 // 1MB is usually enough and avoids excessive bufferbloat
+                udpSocket?.receiveBufferSize = 2 * 1024 * 1024 
                 
                 val serverAddr = InetAddress.getByName(host)
                 val heartbeatPacket = DatagramPacket(ByteArray(1) { 0xFF.toByte() }, 1, serverAddr, port)
                 
-                // Heartbeat thread
                 val hbThread = Thread {
                     while (isRunning.get()) {
                         try {
@@ -99,12 +101,16 @@ class ScreenReceiver(
                 if (length < 1) continue
 
                 when (data[0].toInt()) {
-                    0 -> { // Meta
-                        val bb = ByteBuffer.wrap(data, 1, length - 1)
-                        val w = bb.getInt()
-                        val h = bb.getInt()
-                        videoQueue.offer(VideoTask.Setup(surface, w, h))
-                        onAspectRatioChanged(w.toFloat() / h.toFloat())
+                    0 -> { // Meta: Type(1) + W(4) + H(4) + ServerTime(8)
+                        if (length >= 17) {
+                            val bb = ByteBuffer.wrap(data, 1, length - 1)
+                            val w = bb.getInt()
+                            val h = bb.getInt()
+                            val serverTime = bb.getLong()
+                            serverTimeOffset = System.currentTimeMillis() - serverTime
+                            videoQueue.offer(VideoTask.Setup(surface, w, h, serverTime))
+                            onAspectRatioChanged(w.toFloat() / h.toFloat())
+                        }
                     }
                     1 -> handleFramePart(data, length)
                     2 -> { // Video Config
@@ -112,12 +118,20 @@ class ScreenReceiver(
                         System.arraycopy(data, 1, config, 0, length - 1)
                         videoQueue.offer(VideoTask.Config(config))
                     }
-                    3 -> { // Audio Data
-                        val audio = ByteArray(length - 1)
-                        System.arraycopy(data, 1, audio, 0, length - 1)
-                        if (!audioQueue.offer(AudioTask.Data(audio))) {
-                            audioQueue.poll() // Drop oldest if full to maintain low latency
-                            audioQueue.offer(AudioTask.Data(audio))
+                    3 -> { // Audio Data: Type(1) + Timestamp(8) + Data
+                        if (length > 9) {
+                            val timestamp = ByteBuffer.wrap(data, 1, 8).getLong()
+                            val audio = ByteArray(length - 9)
+                            System.arraycopy(data, 9, audio, 0, length - 9)
+                            
+                            // Sync check: Drop if too old (more than 500ms behind)
+                            val localTimestamp = timestamp + serverTimeOffset
+                            if (System.currentTimeMillis() - localTimestamp < 500) {
+                                if (!audioQueue.offer(AudioTask.Data(audio, timestamp))) {
+                                    audioQueue.poll()
+                                    audioQueue.offer(AudioTask.Data(audio, timestamp))
+                                }
+                            }
                         }
                     }
                     4 -> { // Audio Config
@@ -134,32 +148,34 @@ class ScreenReceiver(
     }
 
     private fun handleFramePart(data: ByteArray, length: Int) {
-        if (length < 5) return
-        val bb = ByteBuffer.wrap(data, 1, 4)
+        if (length < 13) return // Type(1) + Timestamp(8) + FrameIdx(2) + PartIdx(1) + TotalParts(1)
+        val bb = ByteBuffer.wrap(data, 1, 12)
+        val timestamp = bb.getLong()
         val frameIdx = bb.getShort()
         val partIdx = bb.get().toInt() and 0xFF
         val totalParts = bb.get().toInt() and 0xFF
-        val payloadLength = length - 5
+        val payloadLength = length - 13
 
         if (frameIdx != currentFrameIndex) {
             currentFrameIndex = frameIdx
+            currentFrameTimestamp = timestamp
             frameBuffer = arrayOfNulls(totalParts)
             receivedPartsCount = 0
         }
 
         if (frameBuffer != null && partIdx < frameBuffer!!.size && frameBuffer!![partIdx] == null) {
             val payload = ByteArray(payloadLength)
-            System.arraycopy(data, 5, payload, 0, payloadLength)
+            System.arraycopy(data, 13, payload, 0, payloadLength)
             frameBuffer!![partIdx] = payload
             receivedPartsCount++
 
             if (receivedPartsCount == totalParts) {
-                assembleAndQueue()
+                assembleAndQueue(currentFrameTimestamp)
             }
         }
     }
 
-    private fun assembleAndQueue() {
+    private fun assembleAndQueue(timestamp: Long) {
         val parts = frameBuffer ?: return
         var totalSize = 0
         for (p in parts) totalSize += p?.size ?: 0
@@ -173,9 +189,13 @@ class ScreenReceiver(
             }
         }
 
-        if (!videoQueue.offer(VideoTask.Frame(assembled))) {
-            videoQueue.poll() // Drop oldest frame to catch up and reduce latency
-            videoQueue.offer(VideoTask.Frame(assembled))
+        // Drop if too old (more than 300ms behind)
+        val localTimestamp = timestamp + serverTimeOffset
+        if (System.currentTimeMillis() - localTimestamp < 300) {
+            if (!videoQueue.offer(VideoTask.Frame(assembled, timestamp))) {
+                videoQueue.poll()
+                videoQueue.offer(VideoTask.Frame(assembled, timestamp))
+            }
         }
     }
 
@@ -202,7 +222,11 @@ class ScreenReceiver(
                             codec?.let { submitConfig(it, task.data) }
                         }
                         is VideoTask.Frame -> {
-                            codec?.let { decodeVideoFrame(it, task.data) }
+                            // Secondary drop check right before decoding
+                            val localTimestamp = task.timestamp + serverTimeOffset
+                            if (System.currentTimeMillis() - localTimestamp < 200) {
+                                codec?.let { decodeVideoFrame(it, task.data) }
+                            }
                         }
                     }
                 } catch (e: Exception) {
@@ -230,7 +254,6 @@ class ScreenReceiver(
             format.setInteger(MediaFormat.KEY_LOW_LATENCY, 1)
         }
         format.setInteger(MediaFormat.KEY_PRIORITY, 0)
-        format.setInteger(MediaFormat.KEY_OPERATING_RATE, 240)
         
         codec.configure(format, surface, null, 0)
         codec.start()
@@ -288,8 +311,12 @@ class ScreenReceiver(
                         }
                         is AudioTask.Data -> {
                             if (isConfigured) {
-                                codec?.let { c ->
-                                    track?.let { t -> decodeAudioFrame(c, t, task.data) }
+                                // Sync check for audio
+                                val localTimestamp = task.timestamp + serverTimeOffset
+                                if (System.currentTimeMillis() - localTimestamp < 400) {
+                                    codec?.let { c ->
+                                        track?.let { t -> decodeAudioFrame(c, t, task.data) }
+                                    }
                                 }
                             }
                         }

@@ -231,10 +231,11 @@ class ScreenCaptureManager(
     }
 
     private fun sendMetaData() {
-        val header = ByteBuffer.allocate(10)
+        val header = ByteBuffer.allocate(18)
         header.put(0.toByte()) 
         header.putInt(width)
         header.putInt(height)
+        header.putLong(System.currentTimeMillis()) // Current server time for sync
         sendUdpData(header.array())
         
         configData?.let {
@@ -323,7 +324,7 @@ class ScreenCaptureManager(
         }
     }
 
-    private val dataQueue = java.util.concurrent.ArrayBlockingQueue<ByteArray>(20)
+    private val dataQueue = java.util.concurrent.ArrayBlockingQueue<ByteArray>(15)
 
     private fun startNetworkSender() {
         Thread {
@@ -333,24 +334,38 @@ class ScreenCaptureManager(
                     val packet = dataQueue.take()
                     val type = packet[0]
                     if (type == 1.toByte()) { // Video Frame
-                        val data = ByteArray(packet.size - 1)
-                        System.arraycopy(packet, 1, data, 0, data.size)
+                        val data = ByteArray(packet.size - 9)
+                        System.arraycopy(packet, 9, data, 0, data.size)
                         
+                        val timestamp = ByteBuffer.wrap(packet, 1, 8).getLong()
+
                         val totalParts = ((data.size + MTU - 1) / MTU)
                         for (i in 0 until totalParts) {
                             val offset = i * MTU
                             val length = minOf(MTU, data.size - offset)
-                            val packetData = ByteArray(length + 5)
+                            val packetData = ByteArray(length + 13)
                             val buffer = ByteBuffer.wrap(packetData)
                             buffer.put(1.toByte())
+                            buffer.putLong(timestamp) // Sync timestamp
                             buffer.putShort(frameIndex)
                             buffer.put(i.toByte())
                             buffer.put(totalParts.toByte())
-                            System.arraycopy(data, offset, packetData, 5, length)
+                            System.arraycopy(data, offset, packetData, 13, length)
                             sendUdpData(packetData)
                         }
                         frameIndex++
-                    } else { // Audio Data (3) or Audio Config (4)
+                    } else if (type == 3.toByte()) { // Audio
+                        val timestamp = ByteBuffer.wrap(packet, 1, 8).getLong()
+                        val data = ByteArray(packet.size - 9)
+                        System.arraycopy(packet, 9, data, 0, data.size)
+                        
+                        val audioPacket = ByteArray(data.size + 9)
+                        val buffer = ByteBuffer.wrap(audioPacket)
+                        buffer.put(3.toByte())
+                        buffer.putLong(timestamp)
+                        buffer.put(data)
+                        sendUdpData(audioPacket)
+                    } else { // Audio Config (4) or Meta (0) or Video Config (2)
                         sendUdpData(packet)
                     }
                 } catch (e: Exception) {
@@ -390,12 +405,15 @@ class ScreenCaptureManager(
                             configData = data
                         }
                         
-                        val packet = ByteArray(data.size + 1)
-                        packet[0] = 1.toByte()
-                        System.arraycopy(data, 0, packet, 1, data.size)
+                        val packet = ByteArray(data.size + 9)
+                        val buffer = ByteBuffer.wrap(packet)
+                        buffer.put(1.toByte())
+                        buffer.putLong(System.currentTimeMillis()) // Timestamp for sync
+                        buffer.put(data)
                         
+                        // Aggressive dropping to reduce stuttering
                         if (!dataQueue.offer(packet)) {
-                            dataQueue.poll()
+                            dataQueue.poll() // Drop oldest
                             dataQueue.offer(packet)
                         }
                     }
@@ -432,15 +450,16 @@ class ScreenCaptureManager(
 
                     if ((bufferInfo.flags and MediaCodec.BUFFER_FLAG_CODEC_CONFIG) != 0) {
                         audioConfigData = data
-                        // Also send it immediately
                         val configPacket = ByteArray(data.size + 1)
                         configPacket[0] = 4.toByte()
                         System.arraycopy(data, 0, configPacket, 1, data.size)
                         dataQueue.offer(configPacket)
                     } else {
-                        val packet = ByteArray(data.size + 1)
-                        packet[0] = 3.toByte() // Type 3 for Audio
-                        System.arraycopy(data, 0, packet, 1, data.size)
+                        val packet = ByteArray(data.size + 9)
+                        val buffer = ByteBuffer.wrap(packet)
+                        buffer.put(3.toByte())
+                        buffer.putLong(System.currentTimeMillis()) // Timestamp for sync
+                        buffer.put(data)
                         
                         if (!dataQueue.offer(packet)) {
                             dataQueue.poll()

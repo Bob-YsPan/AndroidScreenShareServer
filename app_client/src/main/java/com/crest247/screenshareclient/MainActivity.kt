@@ -21,6 +21,7 @@ import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -55,9 +56,22 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     fun ScreenShareApp() {
-        var ipAddress by remember { mutableStateOf("192.168.43.1") }
+        var ipAddress by remember { mutableStateOf("") }
         var isConnected by remember { mutableStateOf(false) }
         var aspectRatio by remember { mutableFloatStateOf(0.5625f) } 
+
+        // Auto-discovery
+        DisposableEffect(Unit) {
+            val discoveryClient = DiscoveryClient { discoveredIp ->
+                if (!isConnected) {
+                    ipAddress = discoveredIp
+                }
+            }
+            discoveryClient.start()
+            onDispose {
+                discoveryClient.stop()
+            }
+        }
 
         Box(
             modifier = Modifier
@@ -118,7 +132,11 @@ class MainActivity : ComponentActivity() {
                         singleLine = true
                     )
                     Spacer(modifier = Modifier.height(16.dp))
-                    Button(onClick = { isConnected = true }) {
+                    Button(onClick = { 
+                        if (ipAddress.isNotEmpty()) {
+                            isConnected = true 
+                        }
+                    }) {
                         Text("Connect")
                     }
                 }

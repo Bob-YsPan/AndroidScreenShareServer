@@ -17,6 +17,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -35,7 +36,6 @@ class MainActivity : ComponentActivity() {
         ActivityResultContracts.RequestMultiplePermissions()
     ) { permissions ->
         val recordAudioGranted = permissions[Manifest.permission.RECORD_AUDIO] ?: false
-        val notificationGranted = permissions[Manifest.permission.POST_NOTIFICATIONS] ?: true
         
         if (!recordAudioGranted) {
             Toast.makeText(this, "Audio record permission required for system audio", Toast.LENGTH_SHORT).show()
@@ -129,7 +129,15 @@ fun ScreenShareScreen(
     val ipAddress = remember { getIpAddress() }
     val context = androidx.compose.ui.platform.LocalContext.current
 
-    androidx.compose.runtime.DisposableEffect(Unit) {
+    DisposableEffect(ipAddress) {
+        val discoveryServer = DiscoveryServer(ipAddress)
+        discoveryServer.start()
+        onDispose {
+            discoveryServer.stop()
+        }
+    }
+
+    DisposableEffect(Unit) {
         val receiver = object : android.content.BroadcastReceiver() {
             override fun onReceive(context: android.content.Context?, intent: Intent?) {
                 if (intent?.action == "com.crest247.screenshareserver.STOPPED") {
